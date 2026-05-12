@@ -185,6 +185,14 @@
       <input id="search" type="text" placeholder="搜索作者、作品、分类…" />
     </div>
     <div class="top-actions">
+      <button class="btn" id="btn-refresh" title="刷新最新作品">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+        刷新
+      </button>
+      <button class="btn" id="btn-backup" title="导出/导入收藏">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+        备份
+      </button>
       <button class="btn" id="btn-manage" style="display:none">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h12"/></svg>
         管理收藏夹
@@ -201,7 +209,7 @@
     <span class="dot"></span>
     <span id="hero-count">加载中…</span>
     <span>·</span>
-    <span>数据源：bestdesignsonx（每小时更新）</span>
+    <span>数据源：bestdesignsonx · 切回页面自动刷新</span>
   </div>
 </section>
 
@@ -278,10 +286,12 @@
 const SB_URL = 'https://tuzpqmdnxvlzwqthgseg.supabase.co';
 const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR1enBxbWRueHZsendxdGhnc2VnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzUxOTY4MjYsImV4cCI6MjA1MDc3MjgyNn0.rIjO0FCY9rPgsJXCxBho3sCRiepy3s319_BoK6DPZ-U';
 const PAGE_SIZE = 24;
+let lastFetchTs = 0;
 
 async function fetchWorks(from, to){
-  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,time,post_url,interaction,media,avatar&status=eq.Published&order=created_at.desc`;
+  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,time,post_url,interaction,media,avatar&status=eq.Published&order=created_at.desc&_=${Date.now()}`;
   const res = await fetch(url, {
+    cache: 'no-store',
     headers: {
       apikey: SB_KEY,
       Authorization: 'Bearer ' + SB_KEY,
@@ -526,6 +536,7 @@ async function loadMore(){
     state.works = state.works.concat(list);
     state.offset += list.length;
     if(list.length < PAGE_SIZE) state.done = true;
+    lastFetchTs = Date.now();
   }catch(e){
     toast('数据加载失败：'+e.message);
     console.error(e);
@@ -784,6 +795,56 @@ document.addEventListener('keydown', e=>{
     document.querySelectorAll('.modal.open').forEach(m=>closeModal(m));
   }
 });
+
+/* ============== 刷新（重置分页重新拉取） ============== */
+async function reload(silent){
+  state.works = []; state.offset = 0; state.done = false;
+  if(!silent) toast('正在刷新…');
+  await loadMore();
+  if(!silent) toast('已加载最新作品');
+}
+$('#btn-refresh').onclick = ()=>reload(false);
+
+// 标签页恢复可见时，距上次拉取超过 5 分钟则自动刷新
+document.addEventListener('visibilitychange', ()=>{
+  if(!document.hidden && Date.now() - lastFetchTs > 5*60*1000){
+    reload(true);
+  }
+});
+
+/* ============== 收藏数据备份（导出/导入 JSON） ============== */
+$('#btn-backup').onclick = ()=>{
+  const data = { version:1, exportedAt: new Date().toISOString(), cats: getCats() };
+  const choice = prompt(`收藏数据（${data.cats.reduce((a,c)=>a+(c.workIds||[]).length,0)} 件作品）
+
+输入  e  导出 JSON 文件
+输入  i  导入 JSON 文件
+留空取消`, '');
+  if(choice === 'e'){
+    const blob = new Blob([JSON.stringify(data,null,2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `best-designs-backup-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('已导出');
+  }else if(choice === 'i'){
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = '.json,application/json';
+    inp.onchange = async e=>{
+      const f = e.target.files[0]; if(!f) return;
+      try{
+        const obj = JSON.parse(await f.text());
+        if(!Array.isArray(obj.cats)) throw new Error('格式不对');
+        if(!confirm(`将导入 ${obj.cats.length} 个收藏夹，会覆盖当前数据，继续？`)) return;
+        setCats(obj.cats);
+        render();
+        toast('导入成功');
+      }catch(err){ alert('导入失败：'+err.message) }
+    };
+    inp.click();
+  }
+};
 
 /* ============== 初始化 ============== */
 render();
