@@ -189,6 +189,10 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
         刷新
       </button>
+      <button class="btn" id="btn-sync" title="云同步收藏（GitHub Gist）">
+        <span id="sync-dot" style="width:8px;height:8px;border-radius:50%;background:var(--text-3);display:inline-block"></span>
+        <span id="sync-text">同步</span>
+      </button>
       <button class="btn" id="btn-backup" title="导出/导入收藏">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
         备份
@@ -252,7 +256,7 @@
 <!-- 分类管理弹窗 -->
 <div class="modal" id="manage-modal">
   <div class="manage">
-    <h2>收藏夹管理 <button class="modal-close" id="manage-close" style="position:static">
+    <h2><span>收藏夹管理</span> <button class="modal-close" id="manage-close" style="position:static">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
     </button></h2>
     <div class="cat-list" id="cat-list"></div>
@@ -358,7 +362,7 @@ const LS = { favs: 'bd_favs', cats: 'bd_cats' };
 function getFavs(){ try{return JSON.parse(localStorage.getItem(LS.favs))||[]}catch(e){return []} }
 function setFavs(v){ localStorage.setItem(LS.favs, JSON.stringify(v)) }
 function getCats(){ try{return JSON.parse(localStorage.getItem(LS.cats))||[]}catch(e){return []} }
-function setCats(v){ localStorage.setItem(LS.cats, JSON.stringify(v)) }
+function setCats(v){ localStorage.setItem(LS.cats, JSON.stringify(v)); schedulePush(); }
 const PALETTE = ['#ef4444','#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#8b5cf6','#ec4899'];
 
 /* ============== 状态 ============== */
@@ -701,9 +705,10 @@ $('#detail-modal').onclick = e=>{ if(e.target.id==='detail-modal') closeModal($(
 
 /* ============== 分类管理弹窗 ============== */
 function openManage(){
+  if(typeof restoreManageDialog === 'function') restoreManageDialog();
   openModal($('#manage-modal'));
   renderManage();
-  setTimeout(()=>$('#cat-new-input').focus(), 50);
+  setTimeout(()=>$('#cat-new-input')?.focus(), 50);
 }
 $('#btn-manage').onclick = openManage;
 $('#manage-close').onclick = ()=>closeModal($('#manage-modal'));
@@ -845,6 +850,200 @@ $('#btn-backup').onclick = ()=>{
     inp.click();
   }
 };
+
+/* ============== 云同步：GitHub Gist ============== */
+const SYNC_KEY = 'bd_sync_cfg';
+const GIST_FILE = 'best-designs-data.json';
+function getSyncCfg(){ try{return JSON.parse(localStorage.getItem(SYNC_KEY))||null}catch(e){return null} }
+function setSyncCfg(v){ if(v) localStorage.setItem(SYNC_KEY, JSON.stringify(v)); else localStorage.removeItem(SYNC_KEY) }
+
+function setSyncStatus(state, msg){
+  // state: idle / syncing / ok / err / off
+  const dot = $('#sync-dot'), txt = $('#sync-text');
+  const colors = { idle:'var(--text-3)', syncing:'#fbbf24', ok:'#34d399', err:'#ef4444', off:'var(--text-3)' };
+  const labels = { idle:'同步', syncing:'同步中', ok:'已同步', err:'同步失败', off:'同步' };
+  dot.style.background = colors[state];
+  txt.textContent = msg || labels[state];
+  $('#btn-sync').title = msg || (state==='off' ? '云同步收藏（点击配置）' : '云同步收藏');
+}
+
+async function gistApi(method, path, body, cfg){
+  cfg = cfg || getSyncCfg(); if(!cfg) throw new Error('未配置同步');
+  const res = await fetch(`https://api.github.com/gists/${cfg.gistId}${path||''}`, {
+    method,
+    cache: 'no-store',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: 'Bearer ' + cfg.token,
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(body ? {'Content-Type':'application/json'} : {})
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if(!res.ok) throw new Error('Gist API ' + res.status);
+  return res.json();
+}
+
+async function pullFromGist(silent){
+  const cfg = getSyncCfg(); if(!cfg){ if(!silent) toast('请先配置同步'); return }
+  setSyncStatus('syncing', '拉取中…');
+  try{
+    const data = await gistApi('GET');
+    const file = data.files && data.files[GIST_FILE];
+    if(!file || !file.content){
+      // 远端是空的，把本地推上去作为初始化
+      await pushToGist(true);
+      return;
+    }
+    const remote = JSON.parse(file.content);
+    if(Array.isArray(remote.cats)){
+      // 简单合并策略：远端覆盖本地（云端为主）
+      localStorage.setItem(LS.cats, JSON.stringify(remote.cats));
+      render();
+      setSyncStatus('ok', '已同步 ✓');
+      if(!silent) toast('已从云端拉取');
+    }
+  }catch(e){
+    setSyncStatus('err', '同步失败');
+    if(!silent) toast('拉取失败：'+e.message);
+    console.error(e);
+  }
+}
+
+let pushTimer = null;
+function schedulePush(){
+  if(!getSyncCfg()) return;       // 没开同步直接跳过
+  if(suppressPush) return;        // 拉取中产生的 setCats 不要回推
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(()=>pushToGist(true), 1500);  // 防抖 1.5s
+}
+let suppressPush = false;
+
+async function pushToGist(silent){
+  const cfg = getSyncCfg(); if(!cfg) return;
+  setSyncStatus('syncing', '上传中…');
+  try{
+    const data = { version:1, updatedAt: new Date().toISOString(), cats: getCats() };
+    await gistApi('PATCH', '', { files: { [GIST_FILE]: { content: JSON.stringify(data,null,2) } } });
+    setSyncStatus('ok', '已同步 ✓');
+    if(!silent) toast('已上传到云端');
+  }catch(e){
+    setSyncStatus('err', '同步失败');
+    if(!silent) toast('上传失败：'+e.message);
+    console.error(e);
+  }
+}
+
+function openSyncDialog(){
+  const cfg = getSyncCfg() || {};
+  const html = `
+    <div style="font-size:13px;color:var(--text-2);line-height:1.6;margin-bottom:14px">
+      使用 <b>GitHub Gist</b> 作为你的免费云盘，自动同步收藏数据到所有设备。
+    </div>
+    <ol style="font-size:12px;color:var(--text-3);line-height:1.7;padding-left:18px;margin-bottom:14px">
+      <li>新建 <a href="https://gist.github.com" target="_blank" style="color:var(--accent)">Secret Gist</a>，文件名填 <code>${GIST_FILE}</code>，内容写 <code>{}</code>，保存后在地址栏复制 ID（最后那串字符）</li>
+      <li>创建 <a href="https://github.com/settings/tokens?type=beta" target="_blank" style="color:var(--accent)">Personal Access Token (Fine-grained)</a>，<b>Account permissions → Gists 选 Read and write</b>，复制 token</li>
+    </ol>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <label style="font-size:12px;color:var(--text-3)">Gist ID
+        <input id="sync-gist" placeholder="例如 abc123def456..." value="${cfg.gistId||''}" style="margin-top:4px;width:100%;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;outline:none"/>
+      </label>
+      <label style="font-size:12px;color:var(--text-3)">Token (github_pat_xxx 或 ghp_xxx)
+        <input id="sync-token" type="password" placeholder="github_pat_..." value="${cfg.token||''}" style="margin-top:4px;width:100%;padding:8px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;outline:none;font-family:monospace"/>
+      </label>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:18px;justify-content:flex-end">
+      ${cfg.gistId ? '<button class="btn" id="sync-disable" style="color:#ef4444;margin-right:auto">解除绑定</button>' : ''}
+      <button class="btn" id="sync-cancel">取消</button>
+      <button class="btn btn-primary" id="sync-save">保存并测试</button>
+    </div>
+  `;
+  $('#cat-list').innerHTML = html;
+  $('#manage-modal .manage h2 span').textContent = '云同步设置';
+  $('.cat-new').style.display = 'none';
+  openModal($('#manage-modal'));
+
+  $('#sync-cancel').onclick = ()=>{ closeModal($('#manage-modal')); restoreManageDialog() };
+  $('#sync-disable')?.addEventListener('click', ()=>{
+    if(!confirm('解除绑定后将不再同步到云端（本地数据会保留）。继续？')) return;
+    setSyncCfg(null);
+    setSyncStatus('off');
+    closeModal($('#manage-modal')); restoreManageDialog();
+    toast('已解除云同步绑定');
+  });
+  $('#sync-save').onclick = async ()=>{
+    const gistId = $('#sync-gist').value.trim();
+    const token  = $('#sync-token').value.trim();
+    if(!gistId || !token){ alert('两个都得填'); return }
+    const tmpCfg = { gistId, token };
+    try{
+      // 尝试拉一次，校验配置
+      const test = await gistApi('GET', '', null, tmpCfg);
+      if(!test || !test.id) throw new Error('返回数据异常');
+      setSyncCfg(tmpCfg);
+      closeModal($('#manage-modal')); restoreManageDialog();
+      toast('配置成功');
+      // 如果远端有数据，问要不要拉取覆盖；否则直接推送本地数据
+      const file = test.files && test.files[GIST_FILE];
+      const hasRemote = file && file.content && file.content.trim() && file.content.trim() !== '{}';
+      if(hasRemote){
+        if(confirm('云端已有收藏数据，要拉取并覆盖本地吗？\n（点"取消"则把本地数据上传到云端覆盖）')){
+          suppressPush = true;
+          await pullFromGist(false);
+          suppressPush = false;
+        }else{
+          await pushToGist(false);
+        }
+      }else{
+        await pushToGist(false);
+      }
+    }catch(e){
+      alert('校验失败：'+e.message+'\n\n请检查 Gist ID 和 Token 是否正确，Token 是否有 Gists 读写权限。');
+    }
+  };
+}
+function restoreManageDialog(){
+  // 还原"收藏夹管理"标题/输入框
+  const h2span = $('#manage-modal .manage h2 span');
+  if(h2span) h2span.textContent = '收藏夹管理';
+  $('.cat-new').style.display = '';
+}
+
+$('#btn-sync').onclick = ()=>{
+  const cfg = getSyncCfg();
+  if(!cfg){ openSyncDialog(); return }
+  // 已绑定：弹快速菜单
+  const choice = prompt(`云同步已开启
+  
+输入  s  立即上传
+输入  d  立即从云端下载（覆盖本地）
+输入  c  打开配置
+留空取消`, '');
+  if(choice === 's') pushToGist(false);
+  else if(choice === 'd'){
+    if(confirm('从云端下载会覆盖本地收藏数据，继续？')){
+      suppressPush = true;
+      pullFromGist(false).finally(()=>{ suppressPush = false });
+    }
+  }
+  else if(choice === 'c') openSyncDialog();
+};
+
+// 初始化时若已配置，自动拉一次
+(function bootSync(){
+  const cfg = getSyncCfg();
+  if(!cfg){ setSyncStatus('off'); return }
+  setSyncStatus('idle');
+  suppressPush = true;
+  pullFromGist(true).finally(()=>{ suppressPush = false });
+  // 标签页可见时检查云端有没有更新
+  document.addEventListener('visibilitychange', ()=>{
+    if(!document.hidden && getSyncCfg()){
+      suppressPush = true;
+      pullFromGist(true).finally(()=>{ suppressPush = false });
+    }
+  });
+})();
 
 /* ============== 初始化 ============== */
 render();
