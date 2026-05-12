@@ -289,7 +289,7 @@ const PAGE_SIZE = 24;
 let lastFetchTs = 0;
 
 async function fetchWorks(from, to){
-  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,time,post_url,interaction,media,avatar&status=eq.Published&order=created_at.desc&_=${Date.now()}`;
+  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,time,post_url,interaction,media,avatar&status=eq.Published&order=created_at.desc`;
   const res = await fetch(url, {
     cache: 'no-store',
     headers: {
