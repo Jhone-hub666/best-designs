@@ -73,6 +73,8 @@
   .card-media .dur{position:absolute;right:10px;bottom:10px;padding:2px 6px;border-radius:4px;background:rgba(0,0,0,.6);font-size:11px;color:#fff}
   .skeleton{background:linear-gradient(90deg,#1a1a1e 0%,#23232a 50%,#1a1a1e 100%);background-size:200% 100%;animation:sk 1.2s ease-in-out infinite}
   @keyframes sk{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .skel-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+  .skel-card .skel-media{aspect-ratio:4/3;background:linear-gradient(90deg,#1a1a1e 0%,#23232a 50%,#1a1a1e 100%);background-size:200% 100%;animation:sk 1.2s ease-in-out infinite}
   .card:hover .thumb{transform:scale(1.04)}
   .card-media .tag{position:absolute;left:10px;top:10px;padding:4px 8px;border-radius:6px;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);font-size:11px;color:#fff;letter-spacing:.02em;opacity:0;transform:translateY(-4px);transition:all .2s}
   .card:hover .card-media .tag{opacity:1;transform:translateY(0)}
@@ -315,9 +317,11 @@ let lastFetchTs = 0;
 
 async function fetchWorks(from, to){
   const order = state.sortOrder === 'asc' ? 'created_at.asc' : 'created_at.desc';
-  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,time,post_url,interaction,media,avatar&status=eq.Published&order=${order}`;
+  // 只 select 卡片+详情弹窗需要的字段，减少传输量
+  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,post_url,interaction,media,avatar&status=eq.Published&order=${order}`;
   const res = await fetch(url, {
-    cache: 'no-store',
+    // 首次加载用 no-store 保证新鲜，滚动加载后续页允许 5 分钟缓存
+    cache: from === 0 ? 'no-store' : 'default',
     headers: {
       apikey: SB_KEY,
       Authorization: 'Bearer ' + SB_KEY,
@@ -473,6 +477,19 @@ function renderFilters(){
   $('#chip-add').onclick = openManage;
 }
 
+let lastRenderedCount = 0; // 上次渲染了多少作品
+
+// 骨架屏：在数据加载前显示占位卡片
+function showSkeletons(count){
+  const grid = $('#grid');
+  if(grid.children.length > 0) return; // 已有内容则跳过
+  let html = '';
+  for(let i = 0; i < count; i++){
+    html += '<div class="skel-card"><div class="skel-media"></div></div>';
+  }
+  grid.innerHTML = html;
+}
+
 function renderGrid(){
   const list = getVisibleWorks();
   const favs = getFavSet();
@@ -486,36 +503,79 @@ function renderGrid(){
       <p>${state.view==='favorites'?'在作品右上角点击 ♥ 即可保存到收藏夹':'换个关键词试试'}</p>
     </div>${loadMore}`;
     bindLoadMore();
+    lastRenderedCount = 0;
     return;
   }
-  $('#grid').innerHTML = list.map(w=>{
-    const fav = favs.has(w.id);
-    const inCat = cats.find(c => (c.workIds||[]).includes(w.id));
-    const mediaEl = w.isVideo
-      ? `<video class="thumb" data-video="1" src="${w.videoUrl||''}" poster="${w.cover||''}" muted loop playsinline preload="none" referrerpolicy="no-referrer"></video>`
-      : `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.background='#222';this.style.opacity='.3'" />`;
-    const inCatBadge = (fav && inCat) ? `<span class="card-board" title="${inCat.name}">
-      <span style="width:8px;height:8px;border-radius:50%;background:${inCat.color};display:inline-block"></span>${inCat.name}
-    </span>` : '';
-    return `<article class="card" data-id="${w.id}">
-      <div class="card-media">
-        ${mediaEl}
-        <span class="tag">${w.tag}</span>
-        ${inCatBadge}
-        <button class="card-fav ${fav?'active':''}" data-fav="${w.id}" title="${fav?'已保存 · 点击修改收藏夹':'保存到收藏夹'}">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="${fav?'currentColor':'none'}" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>
-        </button>
-      </div>
-    </article>`;
-  }).join('') + loadMore + loader;
+
+  // 判断是否可以增量追加（仅 discover 视图、无搜索、无筛选、新增内容追加时）
+  const canAppend = state.view === 'discover'
+    && !state.keyword
+    && state.filter === 'all'
+    && list.length > lastRenderedCount
+    && lastRenderedCount > 0;
+
+  if(canAppend){
+    // 只渲染新增的卡片并追加
+    const newItems = list.slice(lastRenderedCount);
+    const frag = document.createDocumentFragment();
+    const tmp = document.createElement('div');
+    tmp.innerHTML = newItems.map(w => buildCardHTML(w, favs, cats)).join('');
+    while(tmp.firstChild) frag.appendChild(tmp.firstChild);
+    // 移除旧的 load-more 按钮
+    const oldBtn = $('#load-more');
+    if(oldBtn) oldBtn.closest('.empty')?.remove();
+    // 移除旧的 loader
+    const oldLoader = $('#grid').querySelector('.empty:not([style*="padding:80px"])');
+    if(oldLoader) oldLoader.remove();
+    // 追加新卡片
+    $('#grid').appendChild(frag);
+    // 追加新的 load-more / loader
+    if(loadMore || loader){
+      const foot = document.createElement('div');
+      foot.innerHTML = loadMore + loader;
+      while(foot.firstChild) $('#grid').appendChild(foot.firstChild);
+    }
+    bindCardEvents();
+    observeVideos();
+    bindLoadMore();
+  } else {
+    // 全量重建（切换视图、搜索、筛选等场景）
+    $('#grid').innerHTML = list.map(w => buildCardHTML(w, favs, cats)).join('') + loadMore + loader;
+    bindCardEvents();
+    observeVideos();
+    bindLoadMore();
+  }
+  lastRenderedCount = list.length;
+}
+
+function buildCardHTML(w, favs, cats){
+  const fav = favs.has(w.id);
+  const inCat = cats.find(c => (c.workIds||[]).includes(w.id));
+  const mediaEl = w.isVideo
+    ? `<video class="thumb" data-video="1" src="${w.videoUrl||''}" poster="${w.cover||''}" muted loop playsinline preload="none" referrerpolicy="no-referrer"></video>`
+    : `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.background='#222';this.style.opacity='.3'" />`;
+  const inCatBadge = (fav && inCat) ? `<span class="card-board" title="${inCat.name}">
+    <span style="width:8px;height:8px;border-radius:50%;background:${inCat.color};display:inline-block"></span>${inCat.name}
+  </span>` : '';
+  return `<article class="card" data-id="${w.id}">
+    <div class="card-media">
+      ${mediaEl}
+      <span class="tag">${w.tag}</span>
+      ${inCatBadge}
+      <button class="card-fav ${fav?'active':''}" data-fav="${w.id}" title="${fav?'已保存 · 点击修改收藏夹':'保存到收藏夹'}">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="${fav?'currentColor':'none'}" stroke="currentColor" stroke-width="2"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></svg>
+      </button>
+    </div>
+  </article>`;
+}
+
+function bindCardEvents(){
   $$('.card').forEach(el=>{
     el.onclick = e=>{ if(e.target.closest('[data-fav]')) return; openDetail(el.dataset.id) };
   });
   $$('[data-fav]').forEach(el=>{
     el.onclick = e=>{ e.stopPropagation(); openSavePopover(el, el.dataset.fav) };
   });
-  observeVideos();
-  bindLoadMore();
 }
 
 // 视口内自动播放视频；离开视口暂停以省带宽
@@ -802,9 +862,9 @@ $('#cat-new-input').addEventListener('keydown', e=>{ if(e.key==='Enter') $('#cat
 
 /* ============== 导航 & 搜索 ============== */
 $$('.nav button').forEach(b=>{
-  b.onclick = ()=>{ state.view = b.dataset.view; state.filter='all'; render() };
+  b.onclick = ()=>{ state.view = b.dataset.view; state.filter='all'; lastRenderedCount=0; render() };
 });
-$('#search').addEventListener('input', e=>{ state.keyword = e.target.value; render() });
+$('#search').addEventListener('input', e=>{ state.keyword = e.target.value; lastRenderedCount=0; render() });
 
 /* ============== Toast ============== */
 let toastTimer;
@@ -905,7 +965,9 @@ $('#btn-sort').onclick = ()=>{
 /* ============== 刷新（重置分页重新拉取） ============== */
 async function reload(silent, restorePos){
   state.works = []; state.offset = 0; state.done = false;
+  lastRenderedCount = 0; // 重置渲染计数
   if(!silent) toast('正在刷新…');
+  showSkeletons(12); // 先显示骨架屏
   await loadMore();
   if(!silent) toast('已加载最新作品');
   if(restorePos) restoreScrollPos();
@@ -1155,16 +1217,40 @@ $('#btn-sync').onclick = ()=>{
 /* ============== 初始化 ============== */
 render();
 (async function init(){
+  // 先渲染骨架屏
+  showSkeletons(12);
   await loadMore();
-  // 如果有保存的滚动位置，继续加载数据直到覆盖那个位置
+  // 如果有保存的滚动位置，并行加载多页以快速恢复
   const savedY = parseInt(sessionStorage.getItem(SCROLL_KEY) || '0', 10);
   const ts = parseInt(sessionStorage.getItem(SCROLL_TS_KEY) || '0', 10);
   if(savedY > 200 && Date.now() - ts < 30*60*1000){
-    // 估算需要多少页才能覆盖，每页约 1200px
+    // 估算需要多少页，每页约 1200px
     const pagesNeeded = Math.ceil(savedY / 1200) + 1;
-    const pagesToLoad = Math.min(pagesNeeded, 20); // 最多加载 20 页防卡
-    for(let i = 1; i < pagesToLoad && !state.done; i++){
-      await loadMore();
+    const pagesToLoad = Math.min(pagesNeeded, 15);
+    if(pagesToLoad > 1){
+      // 并行请求所有页
+      const promises = [];
+      for(let p = 1; p < pagesToLoad; p++){
+        const from = p * PAGE_SIZE;
+        const to = from + PAGE_SIZE - 1;
+        promises.push(fetchWorks(from, to));
+      }
+      try{
+        const results = await Promise.all(promises);
+        results.forEach(({total, list}) => {
+          state.total = total || state.total;
+          state.works = state.works.concat(list);
+          state.offset += list.length;
+          if(list.length < PAGE_SIZE) state.done = true;
+        });
+        lastFetchTs = Date.now();
+        render();
+      }catch(e){
+        console.error('并行加载失败，回退到串行', e);
+        for(let i = 1; i < pagesToLoad && !state.done; i++){
+          await loadMore();
+        }
+      }
     }
     // 加载完毕后恢复位置
     restoringScroll = true;
