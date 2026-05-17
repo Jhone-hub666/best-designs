@@ -76,6 +76,11 @@
   .skel-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
   .skel-card .skel-media{aspect-ratio:4/3;background:linear-gradient(90deg,#1a1a1e 0%,#23232a 50%,#1a1a1e 100%);background-size:200% 100%;animation:sk 1.2s ease-in-out infinite}
   .card:hover .thumb{transform:scale(1.04)}
+  /* 渐进加载：模糊占位 → 原图 */
+  .card-media .thumb-placeholder{position:absolute;inset:0;object-fit:cover;filter:blur(20px);transform:scale(1.1);transition:opacity .4s ease}
+  .card-media .thumb-real{position:absolute;inset:0;object-fit:cover;opacity:0;transition:opacity .4s ease}
+  .card-media .thumb-real.loaded{opacity:1}
+  .card-media .thumb-placeholder.hide{opacity:0}
   .card-media .tag{position:absolute;left:10px;top:10px;padding:4px 8px;border-radius:6px;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);font-size:11px;color:#fff;letter-spacing:.02em;opacity:0;transform:translateY(-4px);transition:all .2s}
   .card:hover .card-media .tag{opacity:1;transform:translateY(0)}
   .card-incat{position:absolute;left:10px;bottom:10px;width:8px;height:8px;border-radius:50%;box-shadow:0 0 0 2px rgba(0,0,0,.5)}
@@ -317,10 +322,9 @@ let lastFetchTs = 0;
 
 async function fetchWorks(from, to){
   const order = state.sortOrder === 'asc' ? 'created_at.asc' : 'created_at.desc';
-  // 只 select 卡片+详情弹窗需要的字段，减少传输量
+  // 首页卡片只需核心字段，打开详情时再按需拉 tweet_text
   const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,post_url,interaction,media,avatar&status=eq.Published&order=${order}`;
   const res = await fetch(url, {
-    // 首次加载用 no-store 保证新鲜，滚动加载后续页允许 5 分钟缓存
     cache: from === 0 ? 'no-store' : 'default',
     headers: {
       apikey: SB_KEY,
@@ -333,7 +337,10 @@ async function fetchWorks(from, to){
   if(!res.ok) throw new Error('fetch failed: '+res.status);
   const total = (()=>{const cr=res.headers.get('content-range');return cr?parseInt(cr.split('/')[1]||'0',10):0})();
   const data = await res.json();
-  return {total, list: data.map(normalize)};
+  const list = data.map(normalize);
+  // 异步写入 IndexedDB 缓存（不阻塞渲染）
+  cacheWorksToIDB(list);
+  return {total, list};
 }
 
 // 按 ID 列表直接拉取收藏作品（不走分页，一条请求搞定）
@@ -596,9 +603,17 @@ function renderGrid(){
 function buildCardHTML(w, favs, cats){
   const fav = favs.has(w.id);
   const inCat = cats.find(c => (c.workIds||[]).includes(w.id));
-  const mediaEl = w.isVideo
-    ? `<video class="thumb" data-video="1" src="${w.videoUrl||''}" poster="${w.cover||''}" muted loop playsinline preload="none" referrerpolicy="no-referrer"></video>`
-    : `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.background='#222';this.style.opacity='.3'" />`;
+  // 生成缩略图 URL（Twitter/𝕏 图片加 ?name=small 参数获取小图 ~5KB）
+  const smallImg = toSmallImg(w.img);
+  let mediaEl;
+  if(w.isVideo){
+    mediaEl = `<video class="thumb" data-video="1" src="${w.videoUrl||''}" poster="${w.cover||''}" muted loop playsinline preload="none" referrerpolicy="no-referrer"></video>`;
+  } else if(smallImg && smallImg !== w.img){
+    // 渐进加载：先模糊小图占位，原图加载完后淡入替换
+    mediaEl = `<img class="thumb thumb-placeholder" src="${smallImg}" alt="" loading="eager" referrerpolicy="no-referrer" onerror="this.style.display='none'" /><img class="thumb thumb-real" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" referrerpolicy="no-referrer" onload="this.classList.add('loaded');this.previousElementSibling?.classList.add('hide')" onerror="this.style.display='none';this.previousElementSibling&&(this.previousElementSibling.style.filter='none')" />`;
+  } else {
+    mediaEl = `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.background='#222';this.style.opacity='.3'" />`;
+  }
   const inCatBadge = (fav && inCat) ? `<span class="card-board" title="${inCat.name}">
     <span style="width:8px;height:8px;border-radius:50%;background:${inCat.color};display:inline-block"></span>${inCat.name}
   </span>` : '';
@@ -612,6 +627,17 @@ function buildCardHTML(w, favs, cats){
       </button>
     </div>
   </article>`;
+}
+
+// 将 Twitter 图片 URL 转为缩略图（?name=small 约 120px 宽，~5KB）
+function toSmallImg(url){
+  if(!url) return '';
+  // pbs.twimg.com / twimg.com 图片支持 ?name= 参数
+  if(url.includes('twimg.com')){
+    const sep = url.includes('?') ? '&' : '?';
+    return url + sep + 'name=small';
+  }
+  return '';
 }
 
 function bindCardEvents(){
@@ -932,7 +958,28 @@ async function loadFavorites(){
   state.favLoading = true;
   lastRenderedCount = 0;
   const favIds = [...getFavSet()];
-  // 先清空 grid 再放骨架屏
+
+  // 先尝试从 IndexedDB 缓存读取收藏数据
+  const cached = await readWorksFromIDB(favIds);
+  if(cached.length > 0){
+    // 按收藏顺序排列
+    const idOrder = {};
+    favIds.forEach((id, i) => idOrder[String(id)] = i);
+    state.favWorks = cached.sort((a, b) => idOrder[a.id] - idOrder[b.id]);
+    state.favLoading = false;
+    lastRenderedCount = 0;
+    render();
+    // 后台静默刷新收藏数据
+    try{
+      const fresh = await fetchFavWorks(favIds);
+      state.favWorks = fresh;
+      lastRenderedCount = 0;
+      render();
+    }catch(e){ /* 静默，已有缓存兜底 */ }
+    return;
+  }
+
+  // 无缓存，显示骨架屏
   $('#grid').innerHTML = '';
   showSkeletons(Math.min(favIds.length || 6, 12));
   render(); // 更新 nav/filters 等非 grid 部分
@@ -1297,12 +1344,128 @@ $('#btn-sync').onclick = ()=>{
   });
 })();
 
+/* ============== IndexedDB 缓存（二次访问秒开） ============== */
+const IDB_NAME = 'bestdesigns_cache';
+const IDB_VER = 1;
+const IDB_STORE = 'works';
+let idb = null;
+
+function openIDB(){
+  return new Promise((resolve, reject) => {
+    if(idb) return resolve(idb);
+    const req = indexedDB.open(IDB_NAME, IDB_VER);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)){
+        const store = db.createObjectStore(IDB_STORE, {keyPath:'id'});
+        store.createIndex('cachedAt', 'cachedAt');
+      }
+    };
+    req.onsuccess = e => { idb = e.target.result; resolve(idb) };
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+// 写入缓存（后台异步，不阻塞渲染）
+async function cacheWorksToIDB(works){
+  try{
+    const db = await openIDB();
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    const store = tx.objectStore(IDB_STORE);
+    const now = Date.now();
+    works.forEach(w => {
+      store.put({...w, cachedAt: now});
+    });
+  }catch(e){ /* 缓存失败静默忽略 */ }
+}
+
+// 读取缓存（按 ID 列表）
+async function readWorksFromIDB(ids){
+  try{
+    const db = await openIDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const results = [];
+      let pending = ids.length;
+      if(!pending) return resolve([]);
+      ids.forEach(id => {
+        const req = store.get(String(id));
+        req.onsuccess = () => {
+          if(req.result) results.push(req.result);
+          if(--pending === 0) resolve(results);
+        };
+        req.onerror = () => { if(--pending === 0) resolve(results) };
+      });
+    });
+  }catch(e){ return [] }
+}
+
+// 读取全部缓存（用于首次快速渲染）
+async function readAllCachedFromIDB(){
+  try{
+    const db = await openIDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const store = tx.objectStore(IDB_STORE);
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    });
+  }catch(e){ return [] }
+}
+
+// 清理超过 7 天的旧缓存
+async function pruneOldIDBCache(){
+  try{
+    const db = await openIDB();
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    const store = tx.objectStore(IDB_STORE);
+    const idx = store.index('cachedAt');
+    const cutoff = Date.now() - 7*24*60*60*1000;
+    const range = IDBKeyRange.upperBound(cutoff);
+    idx.openCursor(range).onsuccess = e => {
+      const cur = e.target.result;
+      if(cur){ cur.delete(); cur.continue() }
+    };
+  }catch(e){ /* 静默 */ }
+}
+
 /* ============== 初始化 ============== */
 render();
 (async function init(){
-  // 先渲染骨架屏
-  showSkeletons(12);
-  await loadMore();
+  // 先尝试从 IndexedDB 缓存读取，如果有数据立即渲染
+  const cached = await readAllCachedFromIDB();
+  if(cached.length > 0){
+    // 按当前排序排列缓存数据
+    cached.sort((a, b) => {
+      const aId = parseInt(a.id, 10), bId = parseInt(b.id, 10);
+      return state.sortOrder === 'desc' ? bId - aId : aId - bId;
+    });
+    state.works = cached;
+    state.offset = cached.length;
+    state.total = cached.length;
+    lastRenderedCount = 0;
+    render();
+    // 后台静默刷新第一页数据（no-store）
+    const {total, list} = await fetchWorks(0, PAGE_SIZE - 1);
+    state.total = total;
+    // 合并新数据（去重）
+    const existingIds = new Set(state.works.map(w => w.id));
+    const newItems = list.filter(w => !existingIds.has(w.id));
+    if(newItems.length > 0){
+      state.works = newItems.concat(state.works);
+      state.offset = state.works.length;
+      lastRenderedCount = 0;
+      render();
+    }
+    lastFetchTs = Date.now();
+  } else {
+    // 无缓存，显示骨架屏并正常加载
+    showSkeletons(12);
+    await loadMore();
+  }
+
   // 如果有保存的滚动位置，并行加载多页以快速恢复
   const savedY = parseInt(sessionStorage.getItem(SCROLL_KEY) || '0', 10);
   const ts = parseInt(sessionStorage.getItem(SCROLL_TS_KEY) || '0', 10);
@@ -1343,6 +1506,9 @@ render();
       updateBackPosBtn();
     });
   }
+
+  // 后台清理旧缓存
+  pruneOldIDBCache();
 })();
 </script>
 </body>
