@@ -336,6 +336,42 @@ async function fetchWorks(from, to){
   return {total, list: data.map(normalize)};
 }
 
+// 按 ID 列表直接拉取收藏作品（不走分页，一条请求搞定）
+// 超过 200 个 ID 分批请求（避免 URL 过长）
+async function fetchFavWorks(ids){
+  if(!ids.length) return [];
+  // 确保是数字 ID（Supabase 表 id 列是 integer）
+  const numIds = ids.map(id => parseInt(id, 10)).filter(n => !isNaN(n));
+  if(!numIds.length) return [];
+
+  const BATCH = 200;
+  const batches = [];
+  for(let i = 0; i < numIds.length; i += BATCH){
+    batches.push(numIds.slice(i, i + BATCH));
+  }
+
+  let allData = [];
+  for(const batch of batches){
+    const idList = batch.join(',');
+    const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,post_url,interaction,media,avatar&status=eq.Published&id=in.(${idList})&order=created_at.desc`;
+    const res = await fetch(url, {
+      cache: 'default',
+      headers: {
+        apikey: SB_KEY,
+        Authorization: 'Bearer ' + SB_KEY
+      }
+    });
+    if(!res.ok) throw new Error('fetch fav failed: '+res.status);
+    const data = await res.json();
+    allData = allData.concat(data);
+  }
+
+  // 按收藏顺序排列（最近收藏的在前）
+  const idOrder = {};
+  numIds.forEach((id, i) => idOrder[String(id)] = i);
+  return allData.map(normalize).sort((a, b) => idOrder[a.id] - idOrder[b.id]);
+}
+
 // 关键词 -> 分类的启发式推断（原数据没有官方 tag，这是自动归类）
 const CAT_RULES = [
   {tag:'3D',         kw:['3d','blender','render','c4d','cinema4d','octane']},
@@ -396,13 +432,14 @@ const state = {
   view:'discover', filter:'all', keyword:'',
   works:[], total:0, offset:0, loading:false, done:false,
   sortOrder:'desc', // 'desc'=最新优先, 'asc'=最旧优先
+  favWorks:[], favLoading:false, // 收藏视图独立数据
 };
 const PRESET_CATEGORIES = ['Mobile App','Web','Dashboard','Branding','Editorial','Motion','Illustration','3D','Icon'];
 
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 
-function getWorkById(id){ return state.works.find(w=>w.id===id) }
+function getWorkById(id){ return state.works.find(w=>w.id===id) || state.favWorks.find(w=>w.id===id) }
 
 /* Pin 风：收藏即归入某收藏夹。兼容旧 bd_favs 数据（迁移为"未分类"收藏夹） */
 const UNCAT_ID = '__uncat__';
@@ -428,17 +465,23 @@ function getWorkCat(id){
 }
 
 function getVisibleWorks(){
-  let list = state.works.slice();
+  // 收藏视图：用独立拉取的 favWorks 数据
   if(state.view === 'favorites'){
-    const favs = getFavSet();
-    list = list.filter(w => favs.has(w.id));
+    let list = state.favWorks.slice();
     if(state.filter !== 'all' && state.filter.startsWith('cat:')){
       const cid = state.filter.slice(4);
       const cat = getCats().find(c => c.id === cid);
       const ids = new Set(cat?.workIds||[]);
       list = list.filter(w => ids.has(w.id));
     }
+    if(state.keyword){
+      const k = state.keyword.toLowerCase();
+      list = list.filter(w => (w.title+w.author+w.handle+w.tag+w.desc).toLowerCase().includes(k));
+    }
+    return list;
   }
+  // 发现视图：原有逻辑
+  let list = state.works.slice();
   if(state.keyword){
     const k = state.keyword.toLowerCase();
     list = list.filter(w => (w.title+w.author+w.handle+w.tag+w.desc).toLowerCase().includes(k));
@@ -494,13 +537,15 @@ function renderGrid(){
   const list = getVisibleWorks();
   const favs = getFavSet();
   const cats = ensureUncategorized();
+  const isFavView = state.view === 'favorites';
   $('#hero-count').textContent = state.total ? `${state.total} 件作品` : `${state.works.length} 件作品`;
-  const loader = state.loading ? `<div class="empty" style="padding:40px 0"><div style="color:var(--text-3);font-size:13px">加载中…</div></div>` : '';
-  const loadMore = (!state.done && !state.loading && state.view==='discover') ? `<div class="empty" style="padding:20px 0"><button class="btn" id="load-more">加载更多</button></div>` : '';
-  if(!list.length && !state.loading){
+  const isLoading = state.loading || state.favLoading;
+  const loader = isLoading ? `<div class="empty" style="padding:40px 0"><div style="color:var(--text-3);font-size:13px">加载中…</div></div>` : '';
+  const loadMore = (!state.done && !isLoading && !isFavView) ? `<div class="empty" style="padding:20px 0"><button class="btn" id="load-more">加载更多</button></div>` : '';
+  if(!list.length && !isLoading){
     $('#grid').innerHTML = `<div class="empty">
-      <h3>${state.view==='favorites'?(state.filter==='all'?'还没有收藏的作品':'这个收藏夹里还没有作品'):'没有匹配的作品'}</h3>
-      <p>${state.view==='favorites'?'在作品右上角点击 ♥ 即可保存到收藏夹':'换个关键词试试'}</p>
+      <h3>${isFavView?(state.filter==='all'?'还没有收藏的作品':'这个收藏夹里还没有作品'):'没有匹配的作品'}</h3>
+      <p>${isFavView?'在作品右上角点击 ♥ 即可保存到收藏夹':'换个关键词试试'}</p>
     </div>${loadMore}`;
     bindLoadMore();
     lastRenderedCount = 0;
@@ -508,7 +553,7 @@ function renderGrid(){
   }
 
   // 判断是否可以增量追加（仅 discover 视图、无搜索、无筛选、新增内容追加时）
-  const canAppend = state.view === 'discover'
+  const canAppend = !isFavView
     && !state.keyword
     && state.filter === 'all'
     && list.length > lastRenderedCount
@@ -649,7 +694,9 @@ function saveToBoard(workId, boardId){
   setCats(cats);
   const name = target?.name || '';
   toast(`已保存到"${name}"`);
-  render();
+  // 如果当前在收藏视图，刷新收藏数据
+  if(state.view === 'favorites') loadFavorites();
+  else render();
   refreshSavePopover();
   if($('#detail-modal').classList.contains('open')) refreshDetailFav();
 }
@@ -658,7 +705,8 @@ function removeFromBoards(workId){
   cats.forEach(c => { c.workIds = (c.workIds||[]).filter(id => id !== workId) });
   setCats(cats);
   toast('已移除');
-  render();
+  if(state.view === 'favorites') loadFavorites();
+  else render();
   refreshSavePopover();
   if($('#detail-modal').classList.contains('open')) refreshDetailFav();
 }
@@ -862,9 +910,44 @@ $('#cat-new-input').addEventListener('keydown', e=>{ if(e.key==='Enter') $('#cat
 
 /* ============== 导航 & 搜索 ============== */
 $$('.nav button').forEach(b=>{
-  b.onclick = ()=>{ state.view = b.dataset.view; state.filter='all'; lastRenderedCount=0; render() };
+  b.onclick = ()=>{
+    const newView = b.dataset.view;
+    if(newView === state.view) return;
+    state.view = newView;
+    state.filter = 'all';
+    state.keyword = '';
+    $('#search').value = '';
+    lastRenderedCount = 0;
+    if(newView === 'favorites'){
+      loadFavorites();
+    } else {
+      render();
+    }
+  };
 });
 $('#search').addEventListener('input', e=>{ state.keyword = e.target.value; lastRenderedCount=0; render() });
+
+// 收藏视图：直接按收藏 ID 向 Supabase 拉取对应作品
+async function loadFavorites(){
+  state.favLoading = true;
+  lastRenderedCount = 0;
+  const favIds = [...getFavSet()];
+  // 先清空 grid 再放骨架屏
+  $('#grid').innerHTML = '';
+  showSkeletons(Math.min(favIds.length || 6, 12));
+  render(); // 更新 nav/filters 等非 grid 部分
+  try{
+    state.favWorks = await fetchFavWorks(favIds);
+  }catch(e){
+    toast('收藏加载失败：'+e.message);
+    console.error(e);
+    state.favWorks = [];
+  }finally{
+    state.favLoading = false;
+    lastRenderedCount = 0;
+    render();
+  }
+}
 
 /* ============== Toast ============== */
 let toastTimer;
