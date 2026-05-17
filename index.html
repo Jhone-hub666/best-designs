@@ -164,6 +164,18 @@
     .filters,.grid,.topbar-inner{padding-left:16px;padding-right:16px}
   }
 
+  /* 回到上次位置按钮 */
+  .back-pos{position:fixed;bottom:28px;right:28px;z-index:80;width:44px;height:44px;border-radius:50%;background:var(--surface-2);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow);opacity:0;transform:translateY(8px);transition:all .25s;pointer-events:none;cursor:pointer}
+  .back-pos.show{opacity:1;transform:translateY(0);pointer-events:auto}
+  .back-pos:hover{background:var(--accent);border-color:var(--accent)}
+  .back-pos:hover svg{stroke:#fff}
+  .back-pos svg{width:20px;height:20px;stroke:var(--text-2);fill:none;stroke-width:2;transition:stroke .2s}
+
+  /* 排序切换 */
+  .sort-btn{display:inline-flex;align-items:center;gap:5px}
+  .sort-btn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;transition:transform .2s}
+  .sort-btn.desc svg{transform:rotate(180deg)}
+
   /* 滚动条 */
   ::-webkit-scrollbar{width:8px;height:8px}
   ::-webkit-scrollbar-thumb{background:#2a2a30;border-radius:4px}
@@ -185,6 +197,10 @@
       <input id="search" type="text" placeholder="搜索作者、作品、分类…" />
     </div>
     <div class="top-actions">
+      <button class="btn sort-btn desc" id="btn-sort" title="切换排序：最新优先 / 最旧优先">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12l7-7 7 7"/></svg>
+        <span id="sort-label">最新</span>
+      </button>
       <button class="btn" id="btn-refresh" title="刷新最新作品">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
         刷新
@@ -269,6 +285,11 @@
 
 <div class="toast" id="toast"></div>
 
+<!-- 回到上次位置 -->
+<button class="back-pos" id="back-pos" title="回到上次浏览位置">
+  <svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+</button>
+
 <!-- Pin 风保存弹层 -->
 <div class="save-pop" id="save-pop">
   <div class="save-pop-head">
@@ -293,7 +314,8 @@ const PAGE_SIZE = 24;
 let lastFetchTs = 0;
 
 async function fetchWorks(from, to){
-  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,time,post_url,interaction,media,avatar&status=eq.Published&order=created_at.desc`;
+  const order = state.sortOrder === 'asc' ? 'created_at.asc' : 'created_at.desc';
+  const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,time,post_url,interaction,media,avatar&status=eq.Published&order=${order}`;
   const res = await fetch(url, {
     cache: 'no-store',
     headers: {
@@ -369,6 +391,7 @@ const PALETTE = ['#ef4444','#f97316','#eab308','#22c55e','#06b6d4','#3b82f6','#8
 const state = {
   view:'discover', filter:'all', keyword:'',
   works:[], total:0, offset:0, loading:false, done:false,
+  sortOrder:'desc', // 'desc'=最新优先, 'asc'=最旧优先
 };
 const PRESET_CATEGORIES = ['Mobile App','Web','Dashboard','Branding','Editorial','Motion','Illustration','3D','Icon'];
 
@@ -801,14 +824,98 @@ document.addEventListener('keydown', e=>{
   }
 });
 
+/* ============== 滚动位置记忆 ============== */
+const SCROLL_KEY = 'bd_scroll_y';
+const SCROLL_TS_KEY = 'bd_scroll_ts';
+let restoringScroll = false;
+
+// 保存滚动位置
+function saveScrollPos(){
+  if(restoringScroll) return;
+  const y = window.scrollY;
+  // 只有滚动超过 200px 才记录（避免在顶部反复记录）
+  if(y > 200){
+    sessionStorage.setItem(SCROLL_KEY, String(y));
+    sessionStorage.setItem(SCROLL_TS_KEY, String(Date.now()));
+  }
+}
+
+// 防抖保存
+let scrollSaveTimer = null;
+window.addEventListener('scroll', ()=>{
+  clearTimeout(scrollSaveTimer);
+  scrollSaveTimer = setTimeout(saveScrollPos, 300);
+  // 同时控制"回到上次位置"按钮显示
+  updateBackPosBtn();
+}, {passive:true});
+
+// 恢复滚动位置
+function restoreScrollPos(){
+  const y = parseInt(sessionStorage.getItem(SCROLL_KEY) || '0', 10);
+  const ts = parseInt(sessionStorage.getItem(SCROLL_TS_KEY) || '0', 10);
+  // 只在 30 分钟内有效
+  if(y > 200 && Date.now() - ts < 30*60*1000){
+    restoringScroll = true;
+    // 等待内容渲染
+    const tryScroll = ()=>{
+      const el = document.elementFromPoint(window.innerWidth/2, y);
+      window.scrollTo(0, y);
+      if(window.scrollY < y - 50 && state.works.length > 0){
+        requestAnimationFrame(tryScroll);
+      } else {
+        restoringScroll = false;
+        toast('已回到上次浏览位置');
+      }
+    };
+    // 延迟一点等首批数据加载完
+    setTimeout(tryScroll, 600);
+  }
+}
+
+// 回到上次位置按钮
+function updateBackPosBtn(){
+  const btn = $('#back-pos');
+  const savedY = parseInt(sessionStorage.getItem(SCROLL_KEY) || '0', 10);
+  const ts = parseInt(sessionStorage.getItem(SCROLL_TS_KEY) || '0', 10);
+  const hasValidPos = savedY > 200 && Date.now() - ts < 30*60*1000;
+  // 当前位置离记录位置超过 600px 才显示
+  const farEnough = hasValidPos && Math.abs(window.scrollY - savedY) > 600;
+  btn.classList.toggle('show', farEnough);
+}
+$('#back-pos').onclick = ()=>{
+  const y = parseInt(sessionStorage.getItem(SCROLL_KEY) || '0', 10);
+  if(y > 0){
+    window.scrollTo({top: y, behavior: 'smooth'});
+  }
+};
+
+/* ============== 排序切换 ============== */
+$('#btn-sort').onclick = ()=>{
+  state.sortOrder = state.sortOrder === 'desc' ? 'asc' : 'desc';
+  const btn = $('#btn-sort');
+  const label = $('#sort-label');
+  btn.classList.toggle('desc', state.sortOrder === 'desc');
+  label.textContent = state.sortOrder === 'desc' ? '最新' : '最旧';
+  // 排序变了，清除旧位置
+  sessionStorage.removeItem(SCROLL_KEY);
+  sessionStorage.removeItem(SCROLL_TS_KEY);
+  reload(true);
+};
+
 /* ============== 刷新（重置分页重新拉取） ============== */
-async function reload(silent){
+async function reload(silent, restorePos){
   state.works = []; state.offset = 0; state.done = false;
   if(!silent) toast('正在刷新…');
   await loadMore();
   if(!silent) toast('已加载最新作品');
+  if(restorePos) restoreScrollPos();
 }
-$('#btn-refresh').onclick = ()=>reload(false);
+$('#btn-refresh').onclick = ()=>{
+  // 手动刷新 = 重新开始，清除位置记忆
+  sessionStorage.removeItem(SCROLL_KEY);
+  sessionStorage.removeItem(SCROLL_TS_KEY);
+  reload(false);
+};
 
 // 标签页恢复可见时，距上次拉取超过 5 分钟则自动刷新
 document.addEventListener('visibilitychange', ()=>{
@@ -1047,7 +1154,27 @@ $('#btn-sync').onclick = ()=>{
 
 /* ============== 初始化 ============== */
 render();
-loadMore();
+(async function init(){
+  await loadMore();
+  // 如果有保存的滚动位置，继续加载数据直到覆盖那个位置
+  const savedY = parseInt(sessionStorage.getItem(SCROLL_KEY) || '0', 10);
+  const ts = parseInt(sessionStorage.getItem(SCROLL_TS_KEY) || '0', 10);
+  if(savedY > 200 && Date.now() - ts < 30*60*1000){
+    // 估算需要多少页才能覆盖，每页约 1200px
+    const pagesNeeded = Math.ceil(savedY / 1200) + 1;
+    const pagesToLoad = Math.min(pagesNeeded, 20); // 最多加载 20 页防卡
+    for(let i = 1; i < pagesToLoad && !state.done; i++){
+      await loadMore();
+    }
+    // 加载完毕后恢复位置
+    restoringScroll = true;
+    requestAnimationFrame(()=>{
+      window.scrollTo(0, savedY);
+      restoringScroll = false;
+      updateBackPosBtn();
+    });
+  }
+})();
 </script>
 </body>
 </html>
