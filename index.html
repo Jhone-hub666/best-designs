@@ -4,8 +4,10 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <link rel="preconnect" href="https://tuzpqmdnxvlzwqthgseg.supabase.co" crossorigin>
-<link rel="preconnect" href="https://pbs.twimg.com" crossorigin>
-<link rel="dns-prefetch" href="//pbs.twimg.com">
+<link rel="preconnect" href="https://wsrv.nl" crossorigin>
+<link rel="preconnect" href="https://cdn.bestdesignsonx.com" crossorigin>
+<link rel="dns-prefetch" href="//cdn.bestdesignsonx.com">
+<link rel="dns-prefetch" href="//wsrv.nl">
 <title>Best Designs · 设计师作品聚合</title>
 <style>
   :root{
@@ -632,19 +634,22 @@ function buildCardHTML(w, favs, cats, idx){
     const initials = (w.author||'??').split(/\s+/).map(s=>s[0]).slice(0,2).join('').toUpperCase();
     mediaEl = `<div class="thumb thumb-fallback" style="display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,${w.color},#222);color:#fff;font-size:32px;font-weight:700;letter-spacing:.05em">${initials}</div>`;
   } else if(w.isVideo){
-    // 视频卡片：海报失败也走回退链路
-    const posterUrl = w.cover || w.img || '';
-    const fallbackList = buildImageFallbacks(posterUrl).join('||').replace(/"/g, '&quot;');
-    mediaEl = `<img class="thumb" src="${posterUrl}" alt="${(w.title||'').replace(/"/g,'&quot;')}" loading="${loadingAttr}" decoding="async"${fetchPriorityAttr} referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" />` +
-      `<video class="thumb" data-video="1" data-src="${w.videoUrl||''}" poster="${posterUrl}" muted loop playsinline preload="none" referrerpolicy="no-referrer"></video>`;
-  } else if(smallImg && smallImg !== w.img){
-    // 渐进加载 + 失败回退
-    const fallbackList = buildImageFallbacks(w.img).join('||').replace(/"/g, '&quot;');
-    const phFallbackList = buildImageFallbacks(smallImg).join('||').replace(/"/g, '&quot;');
-    mediaEl = `<img class="thumb thumb-placeholder" src="${smallImg}" alt="" loading="eager" decoding="async" referrerpolicy="no-referrer" data-fallbacks="${phFallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" /><img class="thumb thumb-real" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="${loadingAttr}" decoding="async"${fetchPriorityAttr} referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" />`;
+    // 视频卡片：海报通过 wsrv 压缩加速
+    const posterRaw = w.cover || w.img || '';
+    const posterMedium = toMediumImg(posterRaw) || posterRaw;
+    const posterSmall = toSmallImg(posterRaw) || posterRaw;
+    const fallbackList = buildImageFallbacks(posterRaw).join('||').replace(/"/g, '&quot;');
+    mediaEl =
+      `<img class="thumb thumb-placeholder" src="${posterSmall}" alt="" loading="eager" decoding="async" referrerpolicy="no-referrer" onerror="this.style.display='none'" />` +
+      `<img class="thumb thumb-real" src="${posterMedium}" alt="${(w.title||'').replace(/"/g,'&quot;')}" loading="${loadingAttr}" decoding="async"${fetchPriorityAttr} referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" />` +
+      `<video class="thumb" data-video="1" data-src="${w.videoUrl||''}" poster="${posterMedium}" muted loop playsinline preload="none" referrerpolicy="no-referrer"></video>`;
   } else {
+    // 图片卡片：渐进加载 → 小图占位 + 中图主显 + 失败回退
+    const mediumImg = toMediumImg(w.img) || w.img;
     const fallbackList = buildImageFallbacks(w.img).join('||').replace(/"/g, '&quot;');
-    mediaEl = `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="${loadingAttr}" decoding="async"${fetchPriorityAttr} referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" />`;
+    mediaEl =
+      `<img class="thumb thumb-placeholder" src="${smallImg}" alt="" loading="eager" decoding="async" referrerpolicy="no-referrer" onerror="this.style.display='none'" />` +
+      `<img class="thumb thumb-real" src="${mediumImg}" alt="${w.title.replace(/"/g,'&quot;')}" loading="${loadingAttr}" decoding="async"${fetchPriorityAttr} referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" />`;
   }
   const inCatBadge = (fav && inCat) ? `<span class="card-board" title="${inCat.name}">
     <span style="width:8px;height:8px;border-radius:50%;background:${inCat.color};display:inline-block"></span>${inCat.name}
@@ -661,13 +666,30 @@ function buildCardHTML(w, favs, cats, idx){
   </article>`;
 }
 
-// 将 Twitter 图片 URL 转为缩略图（?name=small）
+// 用 wsrv.nl 做实时图片压缩代理（国内通常比直连原 CDN 快很多）
+// w=宽度，q=质量，output=格式
+function viaWsrv(url, w, q){
+  if(!url) return '';
+  // wsrv 不要带 https://
+  const cleanUrl = url.replace(/^https?:\/\//, '');
+  const params = new URLSearchParams();
+  params.set('url', cleanUrl);
+  if(w) params.set('w', String(w));
+  if(q) params.set('q', String(q));
+  params.set('output', 'webp');
+  return 'https://wsrv.nl/?' + params.toString();
+}
+
+// 缩略图（小图模糊占位用，~2KB）
 function toSmallImg(url){
   if(!url) return '';
-  if(!url.includes('twimg.com')) return '';
-  if(/([?&])name=/.test(url)) return url.replace(/([?&])name=[^&]*/,'$1name=small');
-  const sep = url.includes('?') ? '&' : '?';
-  return url + sep + 'name=small';
+  return viaWsrv(url, 200, 50);
+}
+
+// 中等质量主图（卡片正常显示用，~10KB）
+function toMediumImg(url){
+  if(!url) return '';
+  return viaWsrv(url, 600, 75);
 }
 
 function setImgName(url, name){
@@ -677,15 +699,21 @@ function setImgName(url, name){
   return url + sep + 'name=' + name;
 }
 
+// 多级回退链路：wsrv 压缩失败 → wsrv 大图 → 原图直连 → twimg 兼容回退
 function buildImageFallbacks(url){
   if(!url) return [];
   const arr = [];
+  // 先试 wsrv 大尺寸（如果当前是中尺寸失败）
+  arr.push(viaWsrv(url, 900, 80));
+  // 再试原图直连
+  arr.push(url);
+  // 兼容 twimg.com 的 name 参数回退
   if(url.includes('twimg.com')){
     arr.push(setImgName(url, 'medium'));
     arr.push(setImgName(url, 'large'));
     arr.push(setImgName(url, 'orig'));
   }
-  // 去掉 query 作为最后兜底
+  // 去掉 query 兜底
   arr.push(url.split('?')[0]);
   return [...new Set(arr.filter(u => u && u !== url))];
 }
@@ -933,9 +961,10 @@ function openDetail(id){
   const w = getWorkById(id); if(!w) return;
   currentWorkId = id;
   const media = document.querySelector('.modal-media');
+  const detailImg = w.img ? viaWsrv(w.img, 1600, 88) : '';
   media.innerHTML = w.isVideo
     ? `<video src="${w.videoUrl}" poster="${w.cover}" controls autoplay loop playsinline preload="auto" muted></video>`
-    : `<img id="d-img" src="${w.img}" alt="" referrerpolicy="no-referrer" />`;
+    : `<img id="d-img" src="${detailImg||w.img}" alt="" referrerpolicy="no-referrer" onerror="if(this.src!=='${w.img}')this.src='${w.img}'" />`;
   $('#d-title').textContent = w.title;
   $('#d-author').textContent = w.author;
   $('#d-handle').textContent = w.handle;
