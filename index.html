@@ -621,10 +621,10 @@ function buildCardHTML(w, favs, cats){
   } else if(smallImg && smallImg !== w.img){
     // 渐进加载 + 失败回退：原图失败后尝试 medium / large / orig / 去 query
     const fallbackList = buildImageFallbacks(w.img).join('||').replace(/"/g, '&quot;');
-    mediaEl = `<img class="thumb thumb-placeholder" src="${smallImg}" alt="" loading="eager" referrerpolicy="no-referrer" onerror="this.style.display='none'" /><img class="thumb thumb-real" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="this.classList.add('loaded');if(this.previousElementSibling)this.previousElementSibling.classList.add('hide')" onerror="handleThumbError(this)" />`;
+    mediaEl = `<img class="thumb thumb-placeholder" src="${smallImg}" alt="" loading="eager" referrerpolicy="no-referrer" onerror="this.style.display='none'" /><img class="thumb thumb-real" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" />`;
   } else {
     const fallbackList = buildImageFallbacks(w.img).join('||').replace(/"/g, '&quot;');
-    mediaEl = `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onerror="handleThumbError(this)" />`;
+    mediaEl = `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="handleThumbLoad(this)" onerror="handleThumbError(this)" />`;
   }
   const inCatBadge = (fav && inCat) ? `<span class="card-board" title="${inCat.name}">
     <span style="width:8px;height:8px;border-radius:50%;background:${inCat.color};display:inline-block"></span>${inCat.name}
@@ -670,12 +670,48 @@ function buildImageFallbacks(url){
   return [...new Set(arr.filter(u => u && u !== url))];
 }
 
+const THUMB_TIMEOUT_MS = 2200;
+
+function clearThumbGuard(img){
+  const tid = parseInt(img.dataset.tid || '0', 10);
+  if(tid) clearTimeout(tid);
+  img.dataset.tid = '';
+}
+
+function scheduleThumbGuard(img){
+  clearThumbGuard(img);
+  if(img.dataset.loaded === '1') return;
+  const tid = setTimeout(()=>{
+    // 某些网络环境不会触发 onerror，而是一直 pending，这里用超时兜底切源
+    if(img.dataset.loaded === '1') return;
+    if(img.complete && img.naturalWidth > 0){
+      img.dataset.loaded = '1';
+      return;
+    }
+    handleThumbError(img);
+  }, THUMB_TIMEOUT_MS);
+  img.dataset.tid = String(tid);
+}
+
+function handleThumbLoad(img){
+  img.dataset.loaded = '1';
+  clearThumbGuard(img);
+  if(img.classList.contains('thumb-real')){
+    img.classList.add('loaded');
+    const ph = img.previousElementSibling;
+    if(ph) ph.classList.add('hide');
+  }
+}
+
 function handleThumbError(img){
+  clearThumbGuard(img);
   const list = (img.dataset.fallbacks || '').split('||').filter(Boolean);
   const i = parseInt(img.dataset.fidx || '0', 10);
   if(i < list.length){
     img.dataset.fidx = String(i + 1);
+    img.dataset.loaded = '0';
     img.src = list[i];
+    scheduleThumbGuard(img);
     return;
   }
   // 所有回退都失败：显示低质量占位，至少不是空白
@@ -688,6 +724,18 @@ function handleThumbError(img){
   }
 }
 
+function armThumbGuards(){
+  document.querySelectorAll('.card-media img[data-fallbacks]').forEach(img=>{
+    if(img.dataset.armed === '1') return;
+    img.dataset.armed = '1';
+    if(img.complete && img.naturalWidth > 0){
+      img.dataset.loaded = '1';
+      return;
+    }
+    scheduleThumbGuard(img);
+  });
+}
+
 function bindCardEvents(){
   $$('.card').forEach(el=>{
     el.onclick = e=>{ if(e.target.closest('[data-fav]')) return; openDetail(el.dataset.id) };
@@ -695,6 +743,7 @@ function bindCardEvents(){
   $$('[data-fav]').forEach(el=>{
     el.onclick = e=>{ e.stopPropagation(); openSavePopover(el, el.dataset.fav) };
   });
+  armThumbGuards();
 }
 
 // 视口内自动播放视频；离开视口暂停以省带宽
