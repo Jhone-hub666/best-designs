@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<link rel="preconnect" href="https://tuzpqmdnxvlzwqthgseg.supabase.co" crossorigin>
+<link rel="preconnect" href="https://pbs.twimg.com" crossorigin>
+<link rel="dns-prefetch" href="//pbs.twimg.com">
 <title>Best Designs · 设计师作品聚合</title>
 <style>
   :root{
@@ -64,7 +67,7 @@
 
   /* ---------- 网格 ---------- */
   .grid{max-width:1440px;margin:0 auto;padding:18px 28px 80px;display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:18px}
-  .card{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:all .25s;cursor:pointer}
+  .card{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:all .25s;cursor:pointer;content-visibility:auto;contain-intrinsic-size:300px 225px}
   .card:hover{transform:translateY(-3px);border-color:#3a3a42;box-shadow:var(--shadow)}
   .card-media{aspect-ratio:4/3;position:relative;overflow:hidden;background:#222}
   .card-media .thumb,.card-media video{width:100%;height:100%;object-fit:cover;display:block;transition:transform .4s}
@@ -318,24 +321,31 @@
 const SB_URL = 'https://tuzpqmdnxvlzwqthgseg.supabase.co';
 const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR1enBxbWRueHZsendxdGhnc2VnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzUxOTY4MjYsImV4cCI6MjA1MDc3MjgyNn0.rIjO0FCY9rPgsJXCxBho3sCRiepy3s319_BoK6DPZ-U';
 const PAGE_SIZE = 24;
+const FIRST_PAGE_SIZE = 12; // 首屏先拉 12 条，明显缩短首屏等待
 let lastFetchTs = 0;
 
 async function fetchWorks(from, to){
   const order = state.sortOrder === 'asc' ? 'created_at.asc' : 'created_at.desc';
-  // 首页卡片只需核心字段，打开详情时再按需拉 tweet_text
   const url = `${SB_URL}/rest/v1/bestdesignsonx?select=id,author_name,handle,tweet_text,post_url,interaction,media,avatar&status=eq.Published&order=${order}`;
+  // 只在第一页要总数，且用 planned（比 exact 更快）
+  const headers = {
+    apikey: SB_KEY,
+    Authorization: 'Bearer ' + SB_KEY,
+    Range: `${from}-${to}`,
+    'Range-Unit': 'items'
+  };
+  if(from === 0) headers.Prefer = 'count=planned';
   const res = await fetch(url, {
     cache: from === 0 ? 'no-store' : 'default',
-    headers: {
-      apikey: SB_KEY,
-      Authorization: 'Bearer ' + SB_KEY,
-      Range: `${from}-${to}`,
-      'Range-Unit': 'items',
-      Prefer: 'count=exact'
-    }
+    headers
   });
   if(!res.ok) throw new Error('fetch failed: '+res.status);
-  const total = (()=>{const cr=res.headers.get('content-range');return cr?parseInt(cr.split('/')[1]||'0',10):0})();
+  const total = (()=>{
+    const cr = res.headers.get('content-range');
+    if(!cr) return state.total || 0;
+    const n = parseInt(cr.split('/')[1] || '0', 10);
+    return isNaN(n) ? (state.total || 0) : n;
+  })();
   const data = await res.json();
   const list = data.map(normalize);
   // 异步写入 IndexedDB 缓存（不阻塞渲染）
@@ -609,10 +619,12 @@ function buildCardHTML(w, favs, cats){
   if(w.isVideo){
     mediaEl = `<video class="thumb" data-video="1" src="${w.videoUrl||''}" poster="${w.cover||''}" muted loop playsinline preload="none" referrerpolicy="no-referrer"></video>`;
   } else if(smallImg && smallImg !== w.img){
-    // 渐进加载：先模糊小图占位，原图加载完后淡入替换
-    mediaEl = `<img class="thumb thumb-placeholder" src="${smallImg}" alt="" loading="eager" referrerpolicy="no-referrer" onerror="this.style.display='none'" /><img class="thumb thumb-real" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" referrerpolicy="no-referrer" onload="this.classList.add('loaded');this.previousElementSibling?.classList.add('hide')" onerror="this.style.display='none';this.previousElementSibling&&(this.previousElementSibling.style.filter='none')" />`;
+    // 渐进加载 + 失败回退：原图失败后尝试 medium / large / orig / 去 query
+    const fallbackList = buildImageFallbacks(w.img).join('||').replace(/"/g, '&quot;');
+    mediaEl = `<img class="thumb thumb-placeholder" src="${smallImg}" alt="" loading="eager" referrerpolicy="no-referrer" onerror="this.style.display='none'" /><img class="thumb thumb-real" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onload="this.classList.add('loaded');if(this.previousElementSibling)this.previousElementSibling.classList.add('hide')" onerror="handleThumbError(this)" />`;
   } else {
-    mediaEl = `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.background='#222';this.style.opacity='.3'" />`;
+    const fallbackList = buildImageFallbacks(w.img).join('||').replace(/"/g, '&quot;');
+    mediaEl = `<img class="thumb" src="${w.img||''}" alt="${w.title.replace(/"/g,'&quot;')}" loading="lazy" decoding="async" referrerpolicy="no-referrer" data-fallbacks="${fallbackList}" data-fidx="0" onerror="handleThumbError(this)" />`;
   }
   const inCatBadge = (fav && inCat) ? `<span class="card-board" title="${inCat.name}">
     <span style="width:8px;height:8px;border-radius:50%;background:${inCat.color};display:inline-block"></span>${inCat.name}
@@ -629,15 +641,51 @@ function buildCardHTML(w, favs, cats){
   </article>`;
 }
 
-// 将 Twitter 图片 URL 转为缩略图（?name=small 约 120px 宽，~5KB）
+// 将 Twitter 图片 URL 转为缩略图（?name=small）
 function toSmallImg(url){
   if(!url) return '';
-  // pbs.twimg.com / twimg.com 图片支持 ?name= 参数
+  if(!url.includes('twimg.com')) return '';
+  if(/([?&])name=/.test(url)) return url.replace(/([?&])name=[^&]*/,'$1name=small');
+  const sep = url.includes('?') ? '&' : '?';
+  return url + sep + 'name=small';
+}
+
+function setImgName(url, name){
+  if(!url) return '';
+  if(/([?&])name=/.test(url)) return url.replace(/([?&])name=[^&]*/,'$1name='+name);
+  const sep = url.includes('?') ? '&' : '?';
+  return url + sep + 'name=' + name;
+}
+
+function buildImageFallbacks(url){
+  if(!url) return [];
+  const arr = [];
   if(url.includes('twimg.com')){
-    const sep = url.includes('?') ? '&' : '?';
-    return url + sep + 'name=small';
+    arr.push(setImgName(url, 'medium'));
+    arr.push(setImgName(url, 'large'));
+    arr.push(setImgName(url, 'orig'));
   }
-  return '';
+  // 去掉 query 作为最后兜底
+  arr.push(url.split('?')[0]);
+  return [...new Set(arr.filter(u => u && u !== url))];
+}
+
+function handleThumbError(img){
+  const list = (img.dataset.fallbacks || '').split('||').filter(Boolean);
+  const i = parseInt(img.dataset.fidx || '0', 10);
+  if(i < list.length){
+    img.dataset.fidx = String(i + 1);
+    img.src = list[i];
+    return;
+  }
+  // 所有回退都失败：显示低质量占位，至少不是空白
+  img.style.display = 'none';
+  const ph = img.previousElementSibling;
+  if(ph){
+    ph.classList.remove('hide');
+    ph.style.filter = 'none';
+    ph.style.opacity = '.28';
+  }
 }
 
 function bindCardEvents(){
@@ -689,11 +737,12 @@ async function loadMore(){
   state.loading = true;
   render();
   try{
-    const {total, list} = await fetchWorks(state.offset, state.offset + PAGE_SIZE - 1);
+    const pageSize = state.offset === 0 ? FIRST_PAGE_SIZE : PAGE_SIZE;
+    const {total, list} = await fetchWorks(state.offset, state.offset + pageSize - 1);
     state.total = total || (state.offset + list.length);
     state.works = state.works.concat(list);
     state.offset += list.length;
-    if(list.length < PAGE_SIZE) state.done = true;
+    if(list.length < pageSize) state.done = true;
     lastFetchTs = Date.now();
   }catch(e){
     toast('数据加载失败：'+e.message);
@@ -1448,7 +1497,7 @@ render();
     lastRenderedCount = 0;
     render();
     // 后台静默刷新第一页数据（no-store）
-    const {total, list} = await fetchWorks(0, PAGE_SIZE - 1);
+    const {total, list} = await fetchWorks(0, FIRST_PAGE_SIZE - 1);
     state.total = total;
     // 合并新数据（去重）
     const existingIds = new Set(state.works.map(w => w.id));
@@ -1474,10 +1523,12 @@ render();
     const pagesNeeded = Math.ceil(savedY / 1200) + 1;
     const pagesToLoad = Math.min(pagesNeeded, 15);
     if(pagesToLoad > 1){
-      // 并行请求所有页
+      // 并行请求后续页（从当前 offset 开始，避免首屏大小变化导致跳页）
       const promises = [];
-      for(let p = 1; p < pagesToLoad; p++){
-        const from = p * PAGE_SIZE;
+      const baseOffset = state.offset;
+      const extraPages = pagesToLoad - 1;
+      for(let p = 0; p < extraPages; p++){
+        const from = baseOffset + p * PAGE_SIZE;
         const to = from + PAGE_SIZE - 1;
         promises.push(fetchWorks(from, to));
       }
